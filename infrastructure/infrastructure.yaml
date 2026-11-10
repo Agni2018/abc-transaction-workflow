@@ -491,7 +491,10 @@ Resources:
                 "Bucket.$": "$.detail.bucket.name",
                 "InputKey.$": "$.detail.object.key",
                 "OutputKey": "validated/transactions.csv",
-                "ReportKey": "reports/transactions.json"
+                "ReportKey": "reports/transactions.json",
+                "PollCount": {
+                  "Value": 0
+                }
               },
               "ResultPath": "$.Job",
               "Next": "CheckEC2"
@@ -543,6 +546,7 @@ Resources:
               "Parameters": {
                 "InstanceIds": ["${Ec2InstanceId}"]
               },
+              "ResultPath": null,
               "Next": "WaitForEC2"
             },
 
@@ -616,16 +620,58 @@ Resources:
                 },
                 {
                   "Variable": "$.Invocation.Status",
+                  "StringEquals": "ExecutionTimedOut",
+                  "Next": "PreprocessingFailed"
+                },
+                {
+                  "Variable": "$.Invocation.Status",
+                  "StringEquals": "DeliveryTimedOut",
+                  "Next": "PreprocessingFailed"
+                },
+                {
+                  "Variable": "$.Invocation.Status",
+                  "StringEquals": "Undeliverable",
+                  "Next": "PreprocessingFailed"
+                },
+                {
+                  "Variable": "$.Invocation.Status",
                   "StringEquals": "Cancelled",
                   "Next": "PreprocessingFailed"
                 },
                 {
                   "Variable": "$.Invocation.Status",
-                  "StringEquals": "Cancelling",
+                  "StringEquals": "Terminated",
                   "Next": "PreprocessingFailed"
                 }
               ],
+              "Default": "IncrementPollCount"
+            },
+
+            "IncrementPollCount": {
+              "Type": "Pass",
+              "Parameters": {
+                "Value.$": "States.MathAdd($.Job.PollCount.Value, 1)"
+              },
+              "ResultPath": "$.Job.PollCount",
+              "Next": "CheckPollLimit"
+            },
+
+            "CheckPollLimit": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Job.PollCount.Value",
+                  "NumericGreaterThanEquals": 120,
+                  "Next": "PreprocessingPollTimeout"
+                }
+              ],
               "Default": "WaitBeforeCheckingCommand"
+            },
+
+            "PreprocessingPollTimeout": {
+              "Type": "Fail",
+              "Error": "PreprocessingPollTimeout",
+              "Cause": "SSM command did not reach a terminal status within the polling limit."
             },
 
             "RunECSTask": {
