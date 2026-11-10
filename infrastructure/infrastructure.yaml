@@ -1,0 +1,779 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ABC Startup transaction processing infrastructure
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: Full ECR image URI produced by CodeBuild
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+
+  # --------------------------------------------------
+  # 1. NETWORKING
+  # --------------------------------------------------
+
+  TransactionVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: abc-transaction-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: abc-transaction-igw
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref TransactionVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TransactionVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: abc-public-subnet-a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TransactionVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: abc-public-subnet-b
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TransactionVPC
+      Tags:
+        - Key: Name
+          Value: abc-public-route-table
+
+  DefaultInternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachInternetGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: No inbound access; outbound access for SSM and S3
+      VpcId: !Ref TransactionVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: abc-ec2-sg
+
+  ECSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: No inbound access for the batch ECS task
+      VpcId: !Ref TransactionVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: abc-ecs-sg
+
+  # --------------------------------------------------
+  # 2. S3 STORAGE
+  # --------------------------------------------------
+
+  TransactionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: Project
+          Value: ABC-Transaction-Workflow
+
+  # --------------------------------------------------
+  # 3. EC2 INSTANCE ROLE AND INSTANCE
+  # --------------------------------------------------
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EC2TransactionS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${TransactionBucket.Arn}/incoming/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${TransactionBucket.Arn}/validated/*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  PreprocessingInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - AttachInternetGateway
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      MetadataOptions:
+        HttpTokens: required
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          dnf install -y python3 python3-pip
+
+          mkdir -p /opt/abc
+
+          python3 -m venv /opt/abc/venv
+
+          /opt/abc/venv/bin/pip install boto3
+
+          cat > /opt/abc/preprocess.py <<'PY'
+          import argparse
+          import boto3
+          import csv
+          import io
+          from decimal import Decimal, InvalidOperation
+
+          parser = argparse.ArgumentParser()
+          parser.add_argument("--bucket", required=True)
+          parser.add_argument("--input-key", required=True)
+          parser.add_argument("--output-key", required=True)
+          args = parser.parse_args()
+
+          s3 = boto3.client("s3")
+
+          required_columns = [
+              "transaction_id",
+              "customer_id",
+              "amount",
+              "status"
+          ]
+
+          response = s3.get_object(
+              Bucket=args.bucket,
+              Key=args.input_key
+          )
+
+          content = response["Body"].read().decode("utf-8")
+          reader = csv.DictReader(io.StringIO(content))
+
+          if reader.fieldnames is None:
+              raise ValueError("CSV file is empty or has no header")
+
+          missing = set(required_columns) - set(reader.fieldnames)
+
+          if missing:
+              raise ValueError("Missing columns: " + str(sorted(missing)))
+
+          output = io.StringIO()
+          writer = csv.DictWriter(
+              output,
+              fieldnames=required_columns
+          )
+          writer.writeheader()
+
+          seen_ids = set()
+          row_count = 0
+
+          for row in reader:
+              transaction_id = row["transaction_id"].strip()
+              customer_id = row["customer_id"].strip()
+              status = row["status"].strip().lower()
+
+              if not transaction_id or not customer_id:
+                  raise ValueError("Transaction ID or customer ID is empty")
+
+              if transaction_id in seen_ids:
+                  raise ValueError("Duplicate transaction ID: " + transaction_id)
+
+              seen_ids.add(transaction_id)
+
+              try:
+                  amount = Decimal(row["amount"])
+              except InvalidOperation:
+                  raise ValueError("Invalid amount for " + transaction_id)
+
+              if not amount.is_finite() or amount < 0:
+                  raise ValueError("Amount must be finite and non-negative")
+
+              if status not in ("success", "refund"):
+                  raise ValueError("Unsupported status: " + status)
+
+              writer.writerow({
+                  "transaction_id": transaction_id,
+                  "customer_id": customer_id,
+                  "amount": str(amount),
+                  "status": status
+              })
+
+              row_count += 1
+
+          if row_count == 0:
+              raise ValueError("No transaction records found")
+
+          s3.put_object(
+              Bucket=args.bucket,
+              Key=args.output_key,
+              Body=output.getvalue().encode("utf-8"),
+              ContentType="text/csv"
+          )
+
+          print("Preprocessing completed")
+          print("Validated records:", row_count)
+          print("Output:", args.output_key)
+          PY
+
+          chmod 755 /opt/abc/preprocess.py
+
+          systemctl enable amazon-ssm-agent
+          systemctl restart amazon-ssm-agent
+
+  # --------------------------------------------------
+  # 4. ECS CLUSTER
+  # --------------------------------------------------
+
+  TransactionECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: abc-transaction-cluster
+
+  # --------------------------------------------------
+  # 5. ECS TASK ROLES
+  # --------------------------------------------------
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: ECSTransactionS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${TransactionBucket.Arn}/validated/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${TransactionBucket.Arn}/reports/*'
+
+  # --------------------------------------------------
+  # 6. ECS LOG GROUP
+  # --------------------------------------------------
+
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/abc-transaction-processor
+      RetentionInDays: 7
+
+  # --------------------------------------------------
+  # 7. ECS TASK DEFINITION
+  # --------------------------------------------------
+
+  TransactionTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - ECSLogGroup
+    Properties:
+      Family: abc-transaction-processor
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: transaction-processor
+          Image: !Ref ImageUri
+          Essential: true
+          Environment: []
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: transaction
+
+  # --------------------------------------------------
+  # 8. STEP FUNCTIONS EXECUTION ROLE
+  # --------------------------------------------------
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: TransactionWorkflowPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource: '*'
+
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${PreprocessingInstance}'
+
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${PreprocessingInstance}'
+
+              - Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                Resource: '*'
+
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource: !Ref TransactionTaskDefinition
+
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeTasks
+                  - ecs:StopTask
+                Resource: '*'
+
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt ECSTaskExecutionRole.Arn
+                  - !GetAtt ECSTaskRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule'
+
+  # --------------------------------------------------
+  # 9. STEP FUNCTIONS STATE MACHINE
+  # --------------------------------------------------
+
+  TransactionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: ABC-Transaction-Processing
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+
+      DefinitionString: |
+        {
+          "Comment": "ABC Startup transaction processing workflow",
+          "QueryLanguage": "JSONPath",
+          "StartAt": "PrepareJobInput",
+          "States": {
+
+            "PrepareJobInput": {
+              "Type": "Pass",
+              "Parameters": {
+                "Bucket.$": "$.detail.bucket.name",
+                "InputKey.$": "$.detail.object.key",
+                "OutputKey": "validated/transactions.csv",
+                "ReportKey": "reports/transactions.json"
+              },
+              "ResultPath": "$.Job",
+              "Next": "CheckEC2"
+            },
+
+            "CheckEC2": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ec2:describeInstances",
+              "Parameters": {
+                "InstanceIds": ["${Ec2InstanceId}"]
+              },
+              "ResultSelector": {
+                "InstanceState.$": "$.Reservations[0].Instances[0].State.Name"
+              },
+              "ResultPath": "$.EC2",
+              "Next": "ChooseEC2Action"
+            },
+
+            "ChooseEC2Action": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.EC2.InstanceState",
+                  "StringEquals": "running",
+                  "Next": "SendPreprocessingCommand"
+                },
+                {
+                  "Variable": "$.EC2.InstanceState",
+                  "StringEquals": "stopped",
+                  "Next": "StartEC2"
+                },
+                {
+                  "Variable": "$.EC2.InstanceState",
+                  "StringEquals": "pending",
+                  "Next": "WaitForEC2"
+                },
+                {
+                  "Variable": "$.EC2.InstanceState",
+                  "StringEquals": "stopping",
+                  "Next": "WaitForEC2"
+                }
+              ],
+              "Default": "EC2NotUsable"
+            },
+
+            "StartEC2": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ec2:startInstances",
+              "Parameters": {
+                "InstanceIds": ["${Ec2InstanceId}"]
+              },
+              "Next": "WaitForEC2"
+            },
+
+            "WaitForEC2": {
+              "Type": "Wait",
+              "Seconds": 15,
+              "Next": "CheckEC2"
+            },
+
+            "SendPreprocessingCommand": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+              "Parameters": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds": ["${Ec2InstanceId}"],
+                "Parameters": {
+                  "commands.$": "States.Array(States.Format('sudo /opt/abc/venv/bin/python /opt/abc/preprocess.py --bucket {} --input-key {} --output-key {}', $.Job.Bucket, $.Job.InputKey, $.Job.OutputKey))",
+                  "executionTimeout": ["600"]
+                },
+                "TimeoutSeconds": 600
+              },
+              "ResultPath": "$.SSM",
+              "Next": "WaitBeforeCheckingCommand"
+            },
+
+            "WaitBeforeCheckingCommand": {
+              "Type": "Wait",
+              "Seconds": 5,
+              "Next": "GetCommandInvocation"
+            },
+
+            "GetCommandInvocation": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.SSM.Command.CommandId",
+                "InstanceId": "${Ec2InstanceId}"
+              },
+              "ResultPath": "$.Invocation",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.InvocationDoesNotExist",
+                    "Ssm.InvocationDoesNotExistException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 10,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Next": "CheckPreprocessingStatus"
+            },
+
+            "CheckPreprocessingStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Invocation.Status",
+                  "StringEquals": "Success",
+                  "Next": "RunECSTask"
+                },
+                {
+                  "Variable": "$.Invocation.Status",
+                  "StringEquals": "Failed",
+                  "Next": "PreprocessingFailed"
+                },
+                {
+                  "Variable": "$.Invocation.Status",
+                  "StringEquals": "TimedOut",
+                  "Next": "PreprocessingFailed"
+                },
+                {
+                  "Variable": "$.Invocation.Status",
+                  "StringEquals": "Cancelled",
+                  "Next": "PreprocessingFailed"
+                },
+                {
+                  "Variable": "$.Invocation.Status",
+                  "StringEquals": "Cancelling",
+                  "Next": "PreprocessingFailed"
+                }
+              ],
+              "Default": "WaitBeforeCheckingCommand"
+            },
+
+            "RunECSTask": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Parameters": {
+                "Cluster": "${ClusterArn}",
+                "TaskDefinition": "${TaskDefinitionArn}",
+                "LaunchType": "FARGATE",
+                "NetworkConfiguration": {
+                  "AwsvpcConfiguration": {
+                    "Subnets": [
+                      "${SubnetA}",
+                      "${SubnetB}"
+                    ],
+                    "SecurityGroups": [
+                      "${EcsSecurityGroup}"
+                    ],
+                    "AssignPublicIp": "ENABLED"
+                  }
+                },
+                "Overrides": {
+                  "ContainerOverrides": [
+                    {
+                      "Name": "transaction-processor",
+                      "Environment": [
+                        {
+                          "Name": "BUCKET",
+                          "Value": "${BucketName}"
+                        },
+                        {
+                          "Name": "INPUT_KEY",
+                          "Value.$": "$.Job.OutputKey"
+                        },
+                        {
+                          "Name": "OUTPUT_KEY",
+                          "Value.$": "$.Job.ReportKey"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              },
+              "ResultPath": "$.ECS",
+              "End": true
+            },
+
+            "EC2NotUsable": {
+              "Type": "Fail",
+              "Error": "EC2NotUsable",
+              "Cause": "The preprocessing EC2 instance is not in a usable state."
+            },
+
+            "PreprocessingFailed": {
+              "Type": "Fail",
+              "Error": "PreprocessingFailed",
+              "Cause": "The EC2 preprocessing command did not succeed."
+            }
+          }
+        }
+
+      DefinitionSubstitutions:
+        Ec2InstanceId: !Ref PreprocessingInstance
+        ClusterArn: !GetAtt TransactionECSCluster.Arn
+        TaskDefinitionArn: !Ref TransactionTaskDefinition
+        SubnetA: !Ref PublicSubnetA
+        SubnetB: !Ref PublicSubnetB
+        EcsSecurityGroup: !Ref ECSecurityGroup
+        BucketName: !Ref TransactionBucket
+
+  # --------------------------------------------------
+  # 10. EVENTBRIDGE ROLE
+  # --------------------------------------------------
+
+  EventBridgeStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: StartTransactionStateMachine
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref TransactionStateMachine
+
+  # --------------------------------------------------
+  # 11. EVENTBRIDGE RULE
+  # --------------------------------------------------
+
+  S3TransactionUploadRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: abc-transaction-upload-rule
+      Description: Start transaction processing when a file arrives in S3
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref TransactionBucket
+          object:
+            key:
+              - prefix: incoming/
+      Targets:
+        - Id: StartTransactionWorkflow
+          Arn: !Ref TransactionStateMachine
+          RoleArn: !GetAtt EventBridgeStepFunctionsRole.Arn
+
+Outputs:
+  TransactionBucketName:
+    Description: S3 bucket for transaction files
+    Value: !Ref TransactionBucket
+
+  EC2InstanceId:
+    Description: Preprocessing EC2 instance
+    Value: !Ref PreprocessingInstance
+
+  ECSClusterName:
+    Description: ECS cluster
+    Value: !Ref TransactionECSCluster
+
+  ECSTaskDefinitionArn:
+    Description: ECS task definition
+    Value: !Ref TransactionTaskDefinition
+
+  StateMachineArn:
+    Description: Step Functions state machine
+    Value: !Ref TransactionStateMachine
+
+  EC2SecurityGroupId:
+    Description: EC2 security group
+    Value: !Ref EC2SecurityGroup
+
+  ECSSecurityGroupId:
+    Description: ECS security group
+    Value: !Ref ECSecurityGroup
